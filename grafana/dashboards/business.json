@@ -1,0 +1,208 @@
+{
+  "uid": "fraud-business",
+  "title": "4. Fraud business analytics",
+  "editable": false,
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "state",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres"
+        },
+        "query": "SELECT DISTINCT us_state FROM scores WHERE us_state IS NOT NULL ORDER BY 1",
+        "definition": "SELECT DISTINCT us_state FROM scores WHERE us_state IS NOT NULL ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "refresh": 2,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "merch",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres"
+        },
+        "query": "SELECT DISTINCT merch FROM scores WHERE merch IS NOT NULL ORDER BY 1",
+        "definition": "SELECT DISTINCT merch FROM scores WHERE merch IS NOT NULL ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "refresh": 2,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "histogram",
+      "title": "Score density",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT score FROM scores WHERE $__timeFilter(created_at) AND us_state IN (${state:sqlstring}) AND merch IN (${merch:sqlstring})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "bucketSize": 0.02
+      },
+      "id": 1
+    },
+    {
+      "type": "timeseries",
+      "title": "TPS of filtered transactions",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(created_at, '10s'), count(*) / 10.0 AS tps FROM scores WHERE $__timeFilter(created_at) AND us_state IN (${state:sqlstring}) AND merch IN (${merch:sqlstring}) GROUP BY 1 ORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 2
+    },
+    {
+      "type": "barchart",
+      "title": "Fraud share by category (last 1000 transactions)",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT cat_id, avg(fraud_flag) AS fraud_share FROM (SELECT cat_id, fraud_flag FROM scores ORDER BY id DESC LIMIT 1000) AS last_scores GROUP BY cat_id ORDER BY fraud_share DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "cat_id",
+        "orientation": "horizontal"
+      },
+      "id": 3
+    },
+    {
+      "type": "barchart",
+      "title": "Amount flagged as fraud by state, $ (potential loss)",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT us_state, sum(amount) AS flagged_amount FROM scores WHERE $__timeFilter(created_at) AND fraud_flag = 1 AND us_state IN (${state:sqlstring}) AND merch IN (${merch:sqlstring}) GROUP BY us_state ORDER BY flagged_amount DESC LIMIT 15",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "us_state",
+        "orientation": "horizontal"
+      },
+      "id": 4
+    }
+  ]
+}

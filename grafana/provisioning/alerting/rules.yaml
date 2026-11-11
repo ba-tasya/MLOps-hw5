@@ -1,0 +1,69 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: fraud-detector
+    folder: Fraud alerts
+    interval: 10s
+    rules:
+      - uid: high-fraud-share
+        title: High fraud share
+        condition: C
+        for: 30s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Share of transactions flagged as fraud over the last minute is above 5%
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: A
+              expr: sum(rate(fraud_detector_fraud_flagged_total[1m])) / sum(rate(fraud_detector_transactions_processed_total[1m]))
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.05]
+
+      - uid: stream-stopped
+        title: Transaction stream stopped
+        condition: C
+        for: 30s
+        noDataState: Alerting
+        execErrState: Error
+        annotations:
+          summary: Scoring service processes less than 1 transaction per second
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: A
+              expr: sum(rate(fraud_detector_transactions_processed_total[30s]))
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
