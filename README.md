@@ -1,175 +1,81 @@
-# Антифрод: поток транзакций, скоринг и переобучение
+# MLOps-hw5
 
-Учебный проект обнаружения мошеннических транзакций. Kafka несёт непрерывный поток событий, CatBoost скорит их текущей моделью, а Airflow по расписанию дописывает размеченные месяцы и переобучает модель.
+## Описание
+Мониторинг сервиса скоринга фродовых транзакций (за основу взято дз-3). Сервисы `fraud_detector` и `scoring_writer` отдают метрики в Prometheus, Node Exporter отдает метрики хоста, Grafana показывает дашборды, отметку смены модели и алерты. Источники данных, дашборды и алерты подключаются через provisioning (`grafana/provisioning`)
 
-Датасет можно найти [здесь](https://www.kaggle.com/competitions/teta-ml-1-2025/data). В этом занятии используется файл `train.csv` из каталога практики занятия 07. Путь задаётся переменной `TRAIN_DATA_CSV`.
-
----
-
-## Архитектура
-
-```mermaid
-flowchart LR
-  csv[train.csv] --> loader[data_loader]
-  csv --> simulator[transaction_simulator]
-  loader --> showcase[labeled_transactions]
-  etlDag[supply_labeled_batch] --> showcase
-  showcase --> retrainDag[retrain_catboost]
-  retrainDag --> models[model_registry]
-  simulator --> transactions[Kafka transactions]
-  transactions --> scorer[fraud_detector]
-  models --> scorer
-  scorer --> scoring[Kafka scoring]
-  scoring --> writer[scoring_writer]
-  writer --> scores[scores]
-```
-
-| Сервис | Описание |
-|--------|----------|
-| **Kafka** | Шина сообщений между симулятором потока, скорингом и записью результатов |
-| **Zookeeper** | Управление кластером Kafka |
-| **Kafka UI** | Просмотр топиков `transactions` и `scoring` |
-| **transaction_simulator** | Бесконечно шлёт в `transactions` случайные строки CSV. У каждой новый `transaction_id` и `transaction_time`, равный текущему моменту, формат `YYYY-MM-DD HH:MM` |
-| **fraud_detector** | Препроцессинг и инференс CatBoost. Перед каждым сообщением читает `/models/latest.txt` и подхватывает `my_catboost_<версия>.cbm` без перезапуска |
-| **scoring_writer** | Читает топик `scoring` и пишет `score`, `fraud_flag` и `model_version` в PostgreSQL |
-| **PostgreSQL** | Витрина `labeled_transactions`, состояние окна `training_state` и таблица `scores` |
-| **data_loader** | При старте один раз загружает весь CSV в витрину и собирает исходное окно обучения: январь–март 2019 |
-| **airflow** | Два DAG каждые 5 минут: поставка нового размеченного месяца и переобучение CatBoost |
-
-Общий том `model_registry` смонтирован в Airflow как `/opt/airflow/models` и в `fraud_detector` как `/models`. Логика задач вынесена в `pipeline/`. Файлы в `dags/` только связывают задачи.
-
----
-
-## Структура проекта
-
-```
-.
-├── fraud_detector/           # Онлайн-скоринг
-├── transaction_simulator/    # Непрерывная поставка транзакций в Kafka
-├── scoring_writer/           # Запись скоров в PostgreSQL
-├── data_loader/              # Первичная загрузка размеченной витрины
-├── dags/
-│   ├── retrain_catboost.py   # DAG переобучения
-│   └── supply_labeled_batch.py
-├── pipeline/
-│   ├── db.py                 # Подключение к витрине и training_state
-│   ├── retrain/              # Функции задач переобучения
-│   └── supply/               # Функции задач поставки месяца
-├── airflow/                  # Образ Airflow с CatBoost
-├── docker-compose.yaml
-├── .env.example
-└── README.md
-```
-
----
-
-## Что происходит после запуска
-
-1. `data_loader` копирует `TRAIN_DATA_CSV` в `labeled_transactions` и сохраняет окно января–марта 2019. Повторный старт без `down -v` витрину не перезаливает.
-2. `transaction_simulator` каждые 0.1 секунды отправляет в Kafka случайную транзакцию с текущим временем.
-3. `fraud_detector` скорит поток моделью из общего каталога. До первого переобучения версия — `initial`: в каталог копируется модель из образа.
-4. `scoring_writer` складывает результат в `scores`, включая `model_version`.
-5. DAG `supply_labeled_batch` каждые 5 минут берёт из витрины 100 тысяч случайных строк, переносит их время в следующий календарный месяц и дописывает батч. Наблюдения старше трёх лет относительно самого нового месяца удаляются.
-6. DAG `retrain_catboost` каждые 5 минут забирает следующий месяц витрины, начиная с апреля 2019, сдвигает трёхмесячное окно, учит CatBoost и публикует `my_catboost_<timestamp>.cbm`.
-
-Переобучение и поставка идут по разным указателям месяца. `retrain_catboost` читает исторические месяцы с апреля 2019. `supply_labeled_batch` каждый раз создаёт месяц после максимальной даты витрины, первый такой месяц — апрель 2020. Окно обучения ещё долго не доходит до этих батчей, и очистка трёх лет его не затрагивает.
-
-Оба DAG можно запустить вручную в Airflow, не дожидаясь расписания. Если очередного месяца в витрине ещё нет, задачи переобучения помечаются как skipped.
-
----
-
-## Технологии
-
-- **Python 3.11**
-- **ML**: CatBoost, pandas, numpy
-- **Kafka**: потоковая обработка данных
-- **PostgreSQL**: витрина размеченных данных и результаты скоринга
-- **Airflow 2.10**: поставка месячных батчей и переобучение модели
-- **Docker / Docker Compose**: оркестрация микросервисов
-
----
-
-## Как запустить проект
-
-### 1. Клонируйте репозиторий
-
-```bash
-git clone https://github.com/NikitaMalykhin/mlops_realtime_fraud_detector_airflow.git
-cd mlops_realtime_fraud_detector_airflow
-```
-
-### 2. Создайте `.env` файл
-
+## Шаг 0
+Создать `.env` и указать в `TRAIN_DATA_CSV` полный путь к `train.csv` (не загружается на гх из-за размера)
 ```bash
 cp .env.example .env
 ```
 
-В `TRAIN_DATA_CSV` укажите путь к размеченному `train.csv` на вашей машине.
-
-### 3. Запустите контейнеры
-
+## Шаг 1: запуск
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
+* Grafana: http://localhost:3000 (`admin` / `admin`)
+* Prometheus: http://localhost:9090 (Status -> Targets: `fraud_detector`, `scoring_writer`, `node_exporter` в состоянии UP)
+* метрики сервисов: http://localhost:8000/metrics и http://localhost:8001/metrics
+* Airflow: http://localhost:8081 (`admin` / `admin`)
 
-Нужны [Docker](https://docs.docker.com/engine/install/) и Docker Compose. Первый запуск скачивает образы и загружает витрину, это занимает несколько минут.
+## Шаг 2: само задание
+### 1. Метрики
+`fraud_detector` (порт 8000):
+* `fraud_detector_transactions_processed_total` - обработанные транзакции
+* `fraud_detector_processing_seconds` - время обработки одной транзакции
+* `fraud_detector_score` - распределение скоров
+* `fraud_detector_fraud_flagged_total`, `fraud_detector_fraud_share` - число и доля транзакций, помеченных как фрод
+* `fraud_detector_model_switches_total{version}` - смена версии модели без перезапуска
+* `fraud_detector_errors_total` - доп. метрика: сообщения, которые не удалось обработать. Без нее сервис, который падает на каждом сообщении, на графиках выглядит как пустой поток (панель Processing errors на дашборде 1)
+<img width="314" height="121" alt="Screenshot 2026-11-11 at 20 00 55" src="https://github.com/user-attachments/assets/d8840bca-3d54-43a3-95f6-0203e219683c" />
 
-## Доступные сервисы
+* `fraud_detector_flagged_amount_total` - доп. метрика: сумма транзакций, помеченных как фрод, т е сколько денег модель предлагает заблокировать (панель Amount of transactions flagged as fraud на дашборде 1)
+<img width="619" height="237" alt="Screenshot 2026-11-11 at 20 02 20" src="https://github.com/user-attachments/assets/6797134d-ecf4-4b89-8b1d-f49b9a767f56" />
 
-| Сервис | URL |
-|--------|-----|
-| **Kafka UI** | http://localhost:8080 |
-| **Airflow** | http://localhost:8081 (`admin` / `admin`) |
-| **PostgreSQL** | `localhost:5432`, база `fraud_db` |
 
-Пользователь и пароль Postgres задаются в `.env` (`fraud_user` / `fraud_pass` в шаблоне).
+`scoring_writer` (порт 8001):
+* `scoring_writer_scores_written_total` - записанные скоры
+* `scoring_writer_write_seconds` - время записи в PostgreSQL
+* `scoring_writer_fraud_written_total` - выявленный фрод
+* `scoring_writer_score` - распределение записанных скоров
 
-Посмотреть витрины из контейнера:
-
+Проверяем, что метрики растут вместе с потоком (запустить несколько раз):
 ```bash
-docker compose exec postgres psql -U fraud_user -d fraud_db
+curl -s localhost:8000/metrics | grep fraud_detector_transactions_processed_total
+curl -s localhost:8001/metrics | grep scoring_writer_scores_written_total
 ```
 
----
+### 2. Дашборды
+Grafana -> Dashboards -> папка Fraud monitoring. JSON дашбордов собирает скрипт `grafana/build_dashboards.py`
+* **1. Transaction processing** - скорость потока, время обработки, доля фрода, тепловая карта скоров, свои метрики, скоры и доля фрода по версиям модели из PostgreSQL
+<img width="1301" height="720" alt="Screenshot 2026-11-11 at 20 04 52" src="https://github.com/user-attachments/assets/c1a3e50e-c1fc-4834-9f96-350bad939687" />
 
-## Таблицы PostgreSQL
 
-Таблица `scores`:
+* **2. Results writing** - скорость и время записи в БД, выявленный фрод, тепловая карта записанных скоров
+<img width="1303" height="411" alt="Screenshot 2026-11-11 at 20 05 12" src="https://github.com/user-attachments/assets/125c610c-efcb-4d0a-b70b-bfd6e576b286" />
 
-| Поле | Тип | Описание |
-|------|-----|----------|
-| id | SERIAL | Уникальный ID |
-| transaction_id | TEXT | Идентификатор транзакции |
-| score | FLOAT | Вероятность мошенничества, порог 0.5 |
-| fraud_flag | INT | 1, если score больше 0.5, иначе 0 |
-| model_version | TEXT | Версия CatBoost, которая посчитала скор |
-| created_at | TIMESTAMP | Время записи |
 
-`labeled_transactions` — витрина размеченных транзакций. `training_state` хранит границы трёхмесячного окна обучения и месяц следующего батча.
+* **3. System metrics** - CPU, память, сеть, диск (Node Exporter)
+<img width="1302" height="410" alt="Screenshot 2026-11-11 at 20 05 30" src="https://github.com/user-attachments/assets/d0166387-526b-4f9e-8f85-2fc86b77a0f8" />
 
-Последние скоры:
+* **4. Fraud business analytics** - фильтры `state` и `merch` сверху, плотность скоров и TPS по выбранным штатам и мерчантам, доля фрода по `cat_id` за последние 1000 транзакций, сумма фрода по штатам (доп. график: где потенциальный ущерб больше)
+<img width="1304" height="456" alt="Screenshot 2026-11-11 at 20 06 07" src="https://github.com/user-attachments/assets/b60be2c2-972f-40c1-8299-63099c1f05f5" />
 
-```sql
-SELECT transaction_id, score, fraud_flag, model_version, created_at
-FROM scores
-ORDER BY created_at DESC
-LIMIT 20;
-```
 
-Модели, которые опубликовал DAG:
+Для панелей из PostgreSQL `scoring_writer` пишет в таблицу `scores` поля транзакции `us_state`, `merch`, `cat_id`, `amount`
 
+### 3. Отметка смены модели
+DAG `retrain_catboost` в Airflow запускается раз в 5 минут. Первый прогон всегда публикует новую модель вместо `initial`, сервис скоринга подхватывает ее без перезапуска, и на дашбордах 1 и 2 появляется оранжевая отметка `New model: <версия>` примерно на 30 секунд
 ```bash
-docker compose exec airflow ls -la /opt/airflow/models
+docker compose exec airflow cat /opt/airflow/models/latest.txt
 ```
 
----
+### 4. Алерты
+Grafana -> Alerting -> Alert rules -> папка Fraud alerts
 
-## Как смотреть демонстрацию
+| Алерт | Условие | Как проверить |
+|---|---|---|
+| `High fraud share` | доля помеченных фродом транзакций за последнюю минуту > 5% в течение 30 с | обычно доля меньше 2%, поэтому поменять порог `0.05` на `0.001` в `grafana/provisioning/alerting/rules.yaml` и выполнить `docker compose restart grafana`, через ~1 минуту алерт в состоянии Firing |
+| `Transaction stream stopped` | меньше 1 транзакции в секунду в течение 30 с | `docker compose stop transaction_simulator`, через ~1 минуту алерт в состоянии Firing, после `docker compose start transaction_simulator` возвращается в Normal |
 
-1. В Kafka UI топик `transactions` пополняется каждые 0.1 секунды, топик `scoring` — ответами модели.
-2. В Airflow откройте `supply_labeled_batch` и `retrain_catboost`. Кнопка Trigger запускает прогон сразу.
-3. После публикации модели новые сообщения в `scores` получают свежий `model_version`.
-
-### Очистка
-
-`docker compose down -v` удаляет контейнеры вместе с витриной, окном обучения, реестром моделей и состоянием Airflow. Следующий запуск снова загрузит CSV.
+<img width="1221" height="167" alt="image" src="https://github.com/user-attachments/assets/0564db09-9ea8-4645-8188-f2bb79eb95c2" />
